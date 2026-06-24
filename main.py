@@ -89,7 +89,7 @@ def get_notion_tasks():
         for page in results:
             props = page.get("properties", {})
             # Assumes the title column is literally named "Name"
-            title_list = props.get("Name", {}).get("title", [])
+            title_list = props.get("Task name", {}).get("title", [])
             if title_list:
                 tasks.append(title_list[0].get("plain_text", ""))
                 
