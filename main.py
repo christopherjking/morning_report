@@ -10,12 +10,13 @@ from email.message import EmailMessage
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from google import genai
+from google.genai import types
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
 YOUR_EMAIL = "chris@christopherjking.com" 
-CALENDAR_2_ID = "chrisanddanaking@gmail.com" # Update if the ID differs in settings
+CALENDAR_2_ID = "chrisanddanaking@gmail.com"
 
 LAT = 41.7508
 LON = -88.1535
@@ -30,10 +31,8 @@ def get_google_credentials():
     return Credentials.from_authorized_user_info(creds_dict)
 
 def get_weather():
-    """Fetches weather, converts WMO codes to text, and uses Fahrenheit."""
     url = f"https://api.open-meteo.com/v1/forecast?latitude={LAT}&longitude={LON}&daily=weathercode,temperature_2m_max,temperature_2m_min&temperature_unit=fahrenheit&timezone=America%2FChicago"
     
-    # WMO Weather interpretation codes
     weather_desc = {
         0: "Clear skies ☀️", 1: "Mainly clear 🌤️", 2: "Partly cloudy ⛅", 3: "Overcast ☁️",
         45: "Foggy 🌫️", 48: "Depositing rime fog 🌫️", 
@@ -58,7 +57,6 @@ def get_weather():
         return f"Could not fetch weather: {e}"
 
 def get_notion_tasks():
-    """Fetches 'Do Today' tasks using direct API requests to avoid SDK conflicts."""
     token = os.environ.get("NOTION_TOKEN")
     db_id = os.environ.get("NOTION_DATABASE_ID")
     
@@ -69,12 +67,10 @@ def get_notion_tasks():
         "Notion-Version": "2022-06-28"
     }
     
-    # Note: If your Notion property is a "Select" type instead of "Status", 
-    # change "status" on line 66 and 67 to "select"
     payload = {
         "filter": {
             "property": "Status",
-            "status": {
+            "status": { # Keeping this as "select" based on your previous fix
                 "equals": "Do Today"
             }
         }
@@ -88,7 +84,6 @@ def get_notion_tasks():
         tasks = []
         for page in results:
             props = page.get("properties", {})
-            # Assumes the title column is literally named "Name"
             title_list = props.get("Task name", {}).get("title", [])
             if title_list:
                 tasks.append(title_list[0].get("plain_text", ""))
@@ -117,7 +112,6 @@ def get_calendar_events(creds, now):
                     time_obj = datetime.fromisoformat(start)
                     start = time_obj.strftime("%I:%M %p")
                 
-                # Tag secondary calendar events to tell them apart easily
                 prefix = "" if cal_id == 'primary' else "[Shared] "
                 events_list.append(f"- {start}: {prefix}{event.get('summary', 'Busy')}")
         except Exception as e:
@@ -126,13 +120,10 @@ def get_calendar_events(creds, now):
     return events_list if events_list else ["No events scheduled for today."]
 
 def get_recent_emails(creds):
-    """Fetches emails from the last 24 hours and calculates the total count."""
     service = build('gmail', 'v1', credentials=creds)
     try:
-        # Added "in:inbox" to ensure we only look at your primary inbox
         query = 'newer_than:1d in:inbox -category:promotions'
         
-        # We handle pagination to get an accurate total count of emails
         messages = []
         request = service.users().messages().list(userId='me', q=query)
         while request is not None:
@@ -143,7 +134,7 @@ def get_recent_emails(creds):
         total_count = len(messages)
         
         email_data = []
-        for msg in messages[:30]: # Still limit Gemini processing to top 30 to save tokens
+        for msg in messages[:30]:
             msg_detail = service.users().messages().get(userId='me', id=msg['id'], format='metadata', metadataHeaders=['Subject', 'From']).execute()
             headers = msg_detail.get('payload', {}).get('headers', [])
             
@@ -160,6 +151,7 @@ def get_recent_emails(creds):
 def get_gemini_content(email_data):
     client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
     
+    # 1. Stoic Quote
     stoic_prompt = (
         "Act as a Stoic philosopher in the style of Ryan Holiday. "
         "Provide a powerful, daily quote from Marcus Aurelius, Seneca, or Epictetus. "
@@ -168,6 +160,7 @@ def get_gemini_content(email_data):
     stoic_response = client.models.generate_content(model='gemini-2.5-flash', contents=stoic_prompt)
     stoic_text = stoic_response.text if stoic_response else "Could not generate quote."
     
+    # 2. Email Summary
     email_text = "\n---\n".join(email_data)
     if not email_text.strip():
         email_summary = "No recent emails to summarize."
@@ -181,8 +174,33 @@ def get_gemini_content(email_data):
         )
         email_response = client.models.generate_content(model='gemini-2.5-flash', contents=email_prompt)
         email_summary = email_response.text if email_response else "Could not generate summary."
+
+    # 3. Live News, Sports, and Stocks via Google Search Grounding
+    briefing_prompt = (
+        "You are an assistant preparing a daily morning email report. "
+        "Use your Google Search tool to fetch the most current data for today. "
+        "Format your entire response in clean HTML so it can be embedded directly into an email. "
+        "Do NOT include markdown formatting like ```html. Just return the raw HTML code.\n\n"
+        "Create these three sections. Separate each section with <hr style=\"border: 1px solid #eee;\"> and use <h3 style=\"color: #34495e;\"> for the section titles.\n\n"
+        "1. 📰 Top News: 3 to 5 major headlines right now. Prioritize New York Times, NPR, CNN, or USA Today. Add a bulleted list with a 1-sentence summary for each.\n"
+        "2. 🐻 Chicago Sports: The latest scores (if they played yesterday) and current standings for the Chicago Bulls, Chicago Sky, Chicago White Sox, Chicago Bears, and Chicago Fire.\n"
+        "3. 📈 Stock Market Overview: Yesterday's status of the S&P 500, Dow Jones, and Nasdaq (current index value and percentage change)."
+    )
+    
+    try:
+        briefing_response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=briefing_prompt,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())]
+            )
+        )
+        # Clean up any residual markdown if Gemini accidentally adds it
+        live_briefing_html = briefing_response.text.replace("```html", "").replace("```", "").strip()
+    except Exception as e:
+        live_briefing_html = f"<p>Error fetching live briefing: {e}</p>"
         
-    return stoic_text, email_summary
+    return stoic_text, email_summary, live_briefing_html
 
 def send_email(creds, html_content):
     service = build('gmail', 'v1', credentials=creds)
@@ -207,9 +225,10 @@ def main():
     events = get_calendar_events(google_creds, now)
     tasks = get_notion_tasks()
     
-    # We unpack the tuple now
     recent_emails, email_count = get_recent_emails(google_creds)
-    stoic_quote, email_summary = get_gemini_content(recent_emails)
+    
+    # Unpacking all three Gemini outputs now
+    stoic_quote, email_summary, live_briefing_html = get_gemini_content(recent_emails)
     
     html_report = f"""
     <html>
@@ -242,6 +261,9 @@ def main():
         <div>
             {email_summary.replace(chr(10), '<br>')}
         </div>
+        
+        {live_briefing_html}
+        
       </body>
     </html>
     """
